@@ -1,16 +1,12 @@
 name: Workflow avec OpenBao
 
-# Déclenchement du workflow :
-# - automatiquement lors d'un push sur main ;
-# - manuellement depuis l'onglet Actions de GitHub.
 on:
   push:
     branches:
       - main
   workflow_dispatch:
 
-# Autorisations nécessaires pour que GitHub fournisse
-# un token OIDC à Tailscale.
+# id-token: write est nécessaire pour l'identité fédérée Tailscale
 permissions:
   id-token: write
   contents: read
@@ -20,12 +16,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Récupération du code source du projet.
       - name: Récupérer le dépôt
         uses: actions/checkout@v4
 
-      # Connexion temporaire du runner GitHub au réseau Tailscale.
-      # Cette étape permet d'atteindre la machine locale où OpenBao est installé.
       - name: Se connecter à Tailscale
         uses: tailscale/github-action@v4
         with:
@@ -34,13 +27,13 @@ jobs:
           tags: tag:ci
           ping: ${{ vars.TAILSCALE_OPENBAO_HOST }}
 
-      # Installation de la CLI OpenBao sur le runner GitHub.
-      - name: Installer OpenBao
-        uses: openbao/setup-openbao@v1
+      - name: Vérifier que OpenBao répond
+        env:
+          BAO_ADDR: ${{ vars.BAO_ADDR }}
+        run: |
+          curl -sS --max-time 10 -o /dev/null -w "HTTP %{http_code}\n" "$BAO_ADDR/v1/sys/health"
 
-      # Authentification du workflow auprès d'OpenBao
-      # avec le role_id et le secret_id AppRole.
-      - name: S’authentifier auprès d’OpenBao
+      - name: Récupérer les secrets depuis OpenBao
         env:
           BAO_ADDR: ${{ vars.BAO_ADDR }}
           BAO_ROLE_ID: ${{ secrets.BAO_ROLE_ID }}
@@ -49,40 +42,26 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Authentification AppRole
           BAO_TOKEN="$(
-            bao write -field=token auth/approle/login \
-              role_id="$BAO_ROLE_ID" \
-              secret_id="$BAO_SECRET_ID"
+            curl -sS --fail-with-body -X POST "$BAO_ADDR/v1/auth/approle/login" \
+              -d "$(jq -n --arg r "$BAO_ROLE_ID" --arg s "$BAO_SECRET_ID" \
+                    '{role_id:$r, secret_id:$s}')" \
+            | jq -r '.auth.client_token'
           )"
-
-          # Masquage du token dans les logs GitHub.
           echo "::add-mask::$BAO_TOKEN"
 
-          # Transmission temporaire du token aux étapes suivantes.
-          echo "BAO_TOKEN=$BAO_TOKEN" >> "$GITHUB_ENV"
-
-      # Récupération des valeurs stockées dans OpenBao.
-      # Ces valeurs ne sont pas enregistrées dans GitHub.
-      - name: Récupérer les secrets OpenBao
-        env:
-          BAO_ADDR: ${{ vars.BAO_ADDR }}
-          BAO_TOKEN: ${{ env.BAO_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
+          # Lecture du secret (KV v2 : le chemin contient /data/)
           SECRET_VALUE="$(
-            bao kv get -field=value secret/mon-workflow/config
+            curl -sS --fail-with-body -H "X-Vault-Token: $BAO_TOKEN" \
+              "$BAO_ADDR/v1/secret/data/mon-workflow/config" \
+            | jq -r '.data.data.value'
           )"
-
-          # Masquage du secret dans les logs.
           echo "::add-mask::$SECRET_VALUE"
 
-          # Exemple d'utilisation du secret par le workflow.
-          echo "Secret récupéré depuis OpenBao."
+          # Rendre la valeur disponible aux étapes suivantes
+          echo "MON_SECRET=$SECRET_VALUE" >> "$GITHUB_ENV"
 
-      # Étape métier du workflow.
-      # Les commandes réelles seront ajoutées ici.
       - name: Exécuter le workflow
         run: |
-          echo "Exécution avec les secrets récupérés depuis OpenBao"
+          test -n "$MON_SECRET" && echo "Secret chargé depuis OpenBao (valeur masquée)"
